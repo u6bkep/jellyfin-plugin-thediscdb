@@ -4,7 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using Jellyfin.Data.Enums;
-using Jellyfin.Plugin.TheDiscDb.Parsers;
+
 using Jellyfin.Plugin.TheDiscDb.TheDiscDb;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.TV;
@@ -22,8 +22,8 @@ namespace Jellyfin.Plugin.TheDiscDb.Resolvers;
 /// Resolves BDMV folders inside TV show Season directories into individual Episode items
 /// by looking up the disc in TheDiscDb and mapping playlists to episodes.
 ///
-/// Each episode gets its Path set to the m2ts file(s) from its specific playlist,
-/// so Jellyfin treats them as regular video files — no custom playback pipeline needed.
+/// Each episode gets its Path set to the .mpls playlist file, giving each episode
+/// a unique identity and letting ffprobe/ffmpeg handle segment resolution natively.
 /// </summary>
 public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
 {
@@ -53,7 +53,8 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
         if (args.IsDirectory && args.Parent is Series series)
         {
             var hasBdmv = args.FileSystemChildren.Any(c =>
-                c.IsDirectory && c.Name.Equals("BDMV", StringComparison.OrdinalIgnoreCase));
+                c.IsDirectory && (c.Name.Equals("BDMV", StringComparison.OrdinalIgnoreCase)
+                    || Directory.Exists(Path.Combine(c.FullName, "BDMV"))));
 
             if (hasBdmv)
             {
@@ -71,10 +72,6 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
                         IndexNumber = seasonNumber.Value,
                         SeriesId = series.Id,
                         SeriesName = series.Name,
-                        // Lock the Season so child episodes inherit IsLocked=true.
-                        // This prevents FillMissingEpisodeNumbersFromPath and TMDB
-                        // from overwriting our TheDiscDb-sourced metadata.
-                        IsLocked = true
                     };
                 }
             }
@@ -129,35 +126,71 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
             return new MultiItemResolverResult();
         }
 
-        // Find BDMV subfolder in the file list
-        var bdmvFolder = files.FirstOrDefault(f =>
-            f.IsDirectory && f.Name.Equals("BDMV", StringComparison.OrdinalIgnoreCase));
+        // Find all disc roots: either a direct BDMV child, or subdirectories containing BDMV (multi-disc layout)
+        var discRoots = new List<string>();
+        var consumedDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        if (bdmvFolder is null)
+        if (files.Any(f => f.IsDirectory && f.Name.Equals("BDMV", StringComparison.OrdinalIgnoreCase)))
+        {
+            discRoots.Add(parent.Path);
+            consumedDirs.Add("BDMV");
+            consumedDirs.Add("CERTIFICATE");
+        }
+
+        foreach (var dir in files.Where(f => f.IsDirectory
+            && !f.Name.Equals("BDMV", StringComparison.OrdinalIgnoreCase)
+            && !f.Name.Equals("CERTIFICATE", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (Directory.Exists(Path.Combine(dir.FullName, "BDMV")))
+            {
+                discRoots.Add(dir.FullName);
+                consumedDirs.Add(dir.Name);
+            }
+        }
+
+        if (discRoots.Count == 0)
         {
             return new MultiItemResolverResult();
         }
 
-        // The BDMV's parent directory is the "disc root"
-        var discRoot = Path.GetDirectoryName(bdmvFolder.FullName) ?? parent.Path;
+        var result = new MultiItemResolverResult();
 
+        foreach (var discRoot in discRoots)
+        {
+            ResolveDisc(discRoot, season, series, result);
+        }
+
+        if (result.Items.Count == 0)
+        {
+            return new MultiItemResolverResult();
+        }
+
+        // Pass unconsumed files through to normal resolvers (e.g., standalone MKV episodes)
+        result.ExtraFiles = files
+            .Where(f => !consumedDirs.Contains(f.Name))
+            .ToList();
+
+        return result;
+    }
+
+    private void ResolveDisc(string discRoot, Season? season, Series? series, MultiItemResolverResult result)
+    {
         _logger.LogInformation("TheDiscDb: Found BDMV folder at {Path}, computing ContentHash...", discRoot);
 
         var contentHash = ContentHashCalculator.ComputeHash(discRoot);
         if (contentHash is null)
         {
             _logger.LogWarning("TheDiscDb: Could not compute ContentHash for {Path}", discRoot);
-            return new MultiItemResolverResult();
+            return;
         }
 
         _logger.LogInformation("TheDiscDb: ContentHash = {Hash}", contentHash);
 
-        // Query TheDiscDb (synchronous wrapper — resolver API is synchronous)
-        var disc = _client.GetDiscByHashAsync(contentHash).GetAwaiter().GetResult();
+        var disc = _client.GetDiscByHash(contentHash);
         if (disc is null)
         {
             _logger.LogInformation("TheDiscDb: No match found for hash {Hash}, falling through to default resolver", contentHash);
-            return new MultiItemResolverResult();
+            return;
         }
 
         var episodes = TheDiscDbClient.GetEpisodes(disc);
@@ -166,17 +199,16 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
         if (episodes.Count == 0 && extras.Count == 0)
         {
             _logger.LogInformation("TheDiscDb: Disc {Hash} matched but contains no episodes or extras, falling through", contentHash);
-            return new MultiItemResolverResult();
+            return;
         }
 
         _logger.LogInformation("TheDiscDb: Found {EpCount} episodes and {ExCount} extras on disc {Name}", episodes.Count, extras.Count, disc.Name);
 
-        var result = new MultiItemResolverResult();
-        var streamDir = Path.Combine(discRoot, "BDMV", "STREAM");
+        var playlistDir = Path.Combine(discRoot, "BDMV", "PLAYLIST");
 
         foreach (var title in episodes)
         {
-            var episode = CreateEpisode(title, discRoot, streamDir, contentHash, season, series);
+            var episode = CreateEpisode(title, playlistDir, contentHash, season, series);
             if (episode is not null)
             {
                 result.Items.Add(episode);
@@ -185,27 +217,17 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
 
         foreach (var title in extras)
         {
-            var extra = CreateExtra(title, discRoot, streamDir, contentHash, season);
+            var extra = CreateExtra(title, discRoot, playlistDir, contentHash, season);
             if (extra is not null)
             {
                 result.Items.Add(extra);
             }
         }
-
-        // Pass non-BDMV files through to normal resolvers (e.g., standalone MKV episodes in the same folder)
-        result.ExtraFiles = files
-            .Where(f => !f.Name.Equals("BDMV", StringComparison.OrdinalIgnoreCase)
-                     && !f.Name.Equals("CERTIFICATE", StringComparison.OrdinalIgnoreCase))
-            .ToList();
-
-        _logger.LogInformation("TheDiscDb: Resolved {EpCount} episodes and {ExCount} extras from BDMV at {Path}", episodes.Count, extras.Count, discRoot);
-        return result;
     }
 
     private Episode? CreateEpisode(
         DiscTitle title,
-        string discRoot,
-        string streamDir,
+        string playlistDir,
         string contentHash,
         Season? season,
         Series? series)
@@ -215,36 +237,46 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
             return null;
         }
 
-        // Resolve the m2ts files for this episode's playlist
-        var m2tsFiles = ResolvePlaylistFiles(discRoot, title.SourceFile, title.SegmentMap, streamDir);
-        if (m2tsFiles.Count == 0)
+        var mplsPath = Path.Combine(playlistDir, title.SourceFile);
+        if (!File.Exists(mplsPath))
         {
-            _logger.LogWarning("TheDiscDb: No m2ts files found for playlist {Playlist}", title.SourceFile);
+            _logger.LogWarning("TheDiscDb: Playlist file not found: {Path}", mplsPath);
             return null;
         }
 
         if (!int.TryParse(title.Item.Season, NumberStyles.Integer, CultureInfo.InvariantCulture, out var seasonNumber))
         {
+            _logger.LogWarning("TheDiscDb: Unparseable season \"{Value}\" for {File}", title.Item.Season, title.SourceFile);
             return null;
         }
 
-        if (!int.TryParse(title.Item.Episode, NumberStyles.Integer, CultureInfo.InvariantCulture, out var episodeNumber))
+        if (!TryParseEpisodeRange(title.Item.Episode, out var episodeStart, out var episodeEnd))
         {
+            _logger.LogWarning("TheDiscDb: Unparseable episode \"{Value}\" for {File}", title.Item.Episode, title.SourceFile);
             return null;
         }
+
+        // Build episode tag for provider ID: "S01E03" or "S01E01-E02"
+        var episodeTag = episodeEnd.HasValue
+            ? $"S{seasonNumber:D2}E{episodeStart:D2}-E{episodeEnd.Value:D2}"
+            : $"S{seasonNumber:D2}E{episodeStart:D2}";
+
+        var fallbackName = episodeEnd.HasValue
+            ? $"Episode {episodeStart}-{episodeEnd.Value}"
+            : $"Episode {episodeStart}";
 
         var episode = new Episode
         {
-            Path = m2tsFiles[0],
-            VideoType = VideoType.VideoFile,
+            Path = mplsPath,
+            VideoType = VideoType.BluRay,
             ParentIndexNumber = seasonNumber,
-            IndexNumber = episodeNumber,
-            Name = title.Item.Title ?? $"Episode {episodeNumber}",
+            IndexNumber = episodeStart,
+            IndexNumberEnd = episodeEnd,
+            Name = title.Item.Title ?? fallbackName,
             ProviderIds = new Dictionary<string, string>
             {
-                // Format: "hash:playlist:SxxExx:Title" — encodes everything needed
-                // to restore metadata after the filename parser overwrites it
-                ["TheDiscDb"] = $"{contentHash}:{Path.GetFileNameWithoutExtension(title.SourceFile)}:S{seasonNumber:D2}E{episodeNumber:D2}:{title.Item.Title}"
+                // Format: "hash:playlist:SxxExx[-Eyy]:Title"
+                ["TheDiscDb"] = $"{contentHash}:{Path.GetFileNameWithoutExtension(title.SourceFile)}:{episodeTag}:{title.Item.Title}"
             }
         };
 
@@ -261,19 +293,39 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
             episode.SeriesName = series.Name;
         }
 
-        // If the playlist has multiple m2ts segments, use AdditionalParts
-        if (m2tsFiles.Count > 1)
+        return episode;
+    }
+
+    private static bool TryParseEpisodeRange(string? value, out int start, out int? end)
+    {
+        start = 0;
+        end = null;
+
+        if (string.IsNullOrEmpty(value))
         {
-            episode.AdditionalParts = m2tsFiles.Skip(1).ToArray();
+            return false;
         }
 
-        return episode;
+        var dash = value.IndexOf('-');
+        if (dash < 0)
+        {
+            return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out start);
+        }
+
+        if (int.TryParse(value.AsSpan(0, dash), NumberStyles.Integer, CultureInfo.InvariantCulture, out start)
+            && int.TryParse(value.AsSpan(dash + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var endVal))
+        {
+            end = endVal;
+            return true;
+        }
+
+        return false;
     }
 
     private Video? CreateExtra(
         DiscTitle title,
         string discRoot,
-        string streamDir,
+        string playlistDir,
         string contentHash,
         Season? season)
     {
@@ -282,10 +334,10 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
             return null;
         }
 
-        var m2tsFiles = ResolvePlaylistFiles(discRoot, title.SourceFile, title.SegmentMap, streamDir);
-        if (m2tsFiles.Count == 0)
+        var mplsPath = Path.Combine(playlistDir, title.SourceFile);
+        if (!File.Exists(mplsPath))
         {
-            _logger.LogDebug("TheDiscDb: No m2ts files for extra playlist {Playlist}", title.SourceFile);
+            _logger.LogDebug("TheDiscDb: Playlist file not found for extra: {Path}", mplsPath);
             return null;
         }
 
@@ -293,8 +345,8 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
 
         var video = new Video
         {
-            Path = m2tsFiles[0],
-            VideoType = VideoType.VideoFile,
+            Path = mplsPath,
+            VideoType = VideoType.BluRay,
             Name = title.Item.Title ?? "Extra",
             ExtraType = extraType,
             ProviderIds = new Dictionary<string, string>
@@ -306,11 +358,6 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
         if (season is not null)
         {
             video.OwnerId = season.Id;
-        }
-
-        if (m2tsFiles.Count > 1)
-        {
-            video.AdditionalParts = m2tsFiles.Skip(1).ToArray();
         }
 
         return video;
@@ -379,57 +426,4 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
         return ExtraType.Featurette;
     }
 
-    /// <summary>
-    /// Resolves the m2ts file paths for a given playlist.
-    /// First tries parsing the MPLS file directly. Falls back to SegmentMap if available.
-    /// </summary>
-    private List<string> ResolvePlaylistFiles(string discRoot, string sourceFile, string? segmentMap, string streamDir)
-    {
-        // Try parsing the MPLS file
-        var mplsPath = Path.Combine(discRoot, "BDMV", "PLAYLIST", sourceFile);
-        if (File.Exists(mplsPath))
-        {
-            var clipNames = MplsParser.GetClipFiles(mplsPath);
-            if (clipNames.Count > 0)
-            {
-                var resolved = new List<string>();
-                foreach (var clip in clipNames)
-                {
-                    var fullPath = Path.Combine(streamDir, clip);
-                    if (File.Exists(fullPath))
-                    {
-                        resolved.Add(fullPath);
-                    }
-                }
-
-                if (resolved.Count > 0)
-                {
-                    return resolved;
-                }
-            }
-        }
-
-        // Fallback: use SegmentMap from TheDiscDb
-        if (!string.IsNullOrEmpty(segmentMap))
-        {
-            var resolved = new List<string>();
-            foreach (var segment in segmentMap.Split(',', StringSplitOptions.RemoveEmptyEntries))
-            {
-                var trimmed = segment.Trim();
-                var m2tsName = trimmed.PadLeft(5, '0') + ".m2ts";
-                var fullPath = Path.Combine(streamDir, m2tsName);
-                if (File.Exists(fullPath))
-                {
-                    resolved.Add(fullPath);
-                }
-            }
-
-            if (resolved.Count > 0)
-            {
-                return resolved;
-            }
-        }
-
-        return [];
-    }
 }

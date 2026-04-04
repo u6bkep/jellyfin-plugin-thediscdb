@@ -1,144 +1,53 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Net.Http;
-using System.Text;
 using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.TheDiscDb.TheDiscDb;
 
 /// <summary>
-/// Client for querying the TheDiscDb GraphQL API.
-/// Caches results to disk to minimize API calls across library scans.
+/// Reads disc metadata from a local clone of the TheDiscDb/data git repository.
+/// Builds an in-memory index of ContentHash -> DiscNode at startup.
 /// </summary>
-public class TheDiscDbClient : IDisposable
+public class TheDiscDbClient
 {
-    private readonly HttpClient _httpClient;
     private readonly ILogger _logger;
-    private readonly string _cacheDir;
-    private readonly ConcurrentDictionary<string, DiscNode?> _memoryCache = new();
-    private bool _disposed;
-
-    // The GraphQL schema queries through mediaItems -> releases -> discs.
-    // We filter at the mediaItem level for releases containing our disc hash,
-    // then extract the matching disc client-side.
-    private const string Query = @"
-        query GetDiscByHash($hash: String!) {
-          mediaItems(
-            where: {
-              releases: {
-                some: {
-                  discs: {
-                    some: { contentHash: { eq: $hash } }
-                  }
-                }
-              }
-            }
-          ) {
-            nodes {
-              title
-              slug
-              externalids { tmdb imdb }
-              releases {
-                title
-                slug
-                discs {
-                  contentHash
-                  name
-                  slug
-                  titles {
-                    index
-                    sourceFile
-                    segmentMap
-                    duration
-                    size
-                    item {
-                      title
-                      type
-                      season
-                      episode
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }";
+    private readonly Dictionary<string, DiscNode> _index = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TheDiscDbClient"/> class.
+    /// Indexes all disc JSON files in the repository.
     /// </summary>
-    public TheDiscDbClient(ILogger logger, string cacheDir)
+    public TheDiscDbClient(ILogger logger, string repoPath)
     {
         _logger = logger;
-        _cacheDir = cacheDir;
-        _httpClient = new HttpClient();
 
-        Directory.CreateDirectory(_cacheDir);
+        var dataDir = Path.Combine(repoPath, "data");
+        if (!Directory.Exists(dataDir))
+        {
+            // Maybe they pointed directly at the data/ subdirectory
+            dataDir = repoPath;
+        }
+
+        BuildIndex(dataDir);
     }
 
     /// <summary>
     /// Looks up a disc by its ContentHash.
-    /// Returns cached data if available, otherwise queries the API.
     /// </summary>
-    public async Task<DiscNode?> GetDiscByHashAsync(string contentHash, CancellationToken cancellationToken = default)
+    public DiscNode? GetDiscByHash(string contentHash)
     {
-        if (_memoryCache.TryGetValue(contentHash, out var cached))
-        {
-            return cached;
-        }
-
-        // Check disk cache
-        var cacheFile = Path.Combine(_cacheDir, contentHash + ".json");
-        if (File.Exists(cacheFile))
-        {
-            var cacheAge = DateTime.UtcNow - File.GetLastWriteTimeUtc(cacheFile);
-            var maxAge = TimeSpan.FromHours(TheDiscDbPlugin.Instance?.Configuration.CacheHours ?? 168);
-
-            if (cacheAge < maxAge)
-            {
-                try
-                {
-                    var cacheJson = await File.ReadAllTextAsync(cacheFile, cancellationToken).ConfigureAwait(false);
-                    var cacheResult = JsonSerializer.Deserialize<DiscNode>(cacheJson);
-                    _memoryCache[contentHash] = cacheResult;
-                    return cacheResult;
-                }
-                catch (JsonException)
-                {
-                    // Corrupt cache, re-fetch
-                }
-            }
-        }
-
-        // Query API
-        var endpoint = TheDiscDbPlugin.Instance?.Configuration.ApiEndpoint ?? "https://thediscdb.com/graphql";
-        var disc = await QueryApiAsync(endpoint, contentHash, cancellationToken).ConfigureAwait(false);
-
-        _memoryCache[contentHash] = disc;
-
-        // Write to disk cache
-        if (disc is not null)
-        {
-            try
-            {
-                var json = JsonSerializer.Serialize(disc);
-                await File.WriteAllTextAsync(cacheFile, json, cancellationToken).ConfigureAwait(false);
-            }
-            catch (IOException ex)
-            {
-                _logger.LogWarning(ex, "Failed to write TheDiscDb cache file: {Path}", cacheFile);
-            }
-        }
-
+        _index.TryGetValue(contentHash, out var disc);
         return disc;
     }
+
+    /// <summary>
+    /// Gets the number of indexed discs.
+    /// </summary>
+    public int IndexedDiscCount => _index.Count;
 
     /// <summary>
     /// Gets the episodes from a disc, filtered to only Episode-type items.
@@ -149,8 +58,14 @@ public class TheDiscDbClient : IDisposable
             .Where(t => t.Item?.Type is not null
                 && t.Item.Type.Equals("Episode", StringComparison.OrdinalIgnoreCase)
                 && t.Item.Season is not null
-                && t.Item.Episode is not null)
-            .OrderBy(t => int.TryParse(t.Item!.Episode, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ep) ? ep : 0)
+                && !string.IsNullOrEmpty(t.Item.Episode))
+            .OrderBy(t =>
+            {
+                var ep = t.Item!.Episode!;
+                var dash = ep.IndexOf('-');
+                var start = dash >= 0 ? ep.AsSpan(0, dash) : ep.AsSpan();
+                return int.TryParse(start, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : 0;
+            })
             .ToList() ?? [];
     }
 
@@ -167,73 +82,59 @@ public class TheDiscDbClient : IDisposable
             .ToList() ?? [];
     }
 
-    private async Task<DiscNode?> QueryApiAsync(string endpoint, string contentHash, CancellationToken cancellationToken)
+    private void BuildIndex(string dataDir)
     {
-        try
+        if (!Directory.Exists(dataDir))
         {
-            var requestBody = new
+            _logger.LogError("TheDiscDb data directory not found: {Path}", dataDir);
+            return;
+        }
+
+        var discFiles = Directory.GetFiles(dataDir, "disc*.json", SearchOption.AllDirectories);
+        _logger.LogInformation("TheDiscDb: Indexing {Count} disc files from {Path}", discFiles.Length, dataDir);
+
+        foreach (var discFile in discFiles)
+        {
+            try
             {
-                query = Query,
-                variables = new { hash = contentHash }
-            };
+                var json = File.ReadAllText(discFile);
+                var disc = JsonSerializer.Deserialize<DiscNode>(json);
 
-            var json = JsonSerializer.Serialize(requestBody);
-            using var content = new StringContent(json, Encoding.UTF8, "application/json");
-            using var response = await _httpClient.PostAsync(endpoint, content, cancellationToken).ConfigureAwait(false);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                _logger.LogWarning("TheDiscDb API returned {StatusCode} for hash {Hash}", response.StatusCode, contentHash);
-                return null;
-            }
-
-            var responseJson = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            var result = JsonSerializer.Deserialize<DiscQueryResult>(responseJson);
-
-            // Navigate: mediaItems -> releases -> discs, find the disc matching our hash
-            var mediaItem = result?.Data?.MediaItems?.Nodes?.FirstOrDefault();
-            if (mediaItem is null)
-            {
-                _logger.LogDebug("No media item found in TheDiscDb for hash {Hash}", contentHash);
-                return null;
-            }
-
-            foreach (var release in mediaItem.Releases ?? [])
-            {
-                foreach (var disc in release.Discs ?? [])
+                if (disc?.ContentHash is null)
                 {
-                    if (string.Equals(disc.ContentHash, contentHash, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                }
+
+                disc.SourcePath = discFile;
+
+                // Try to load parent metadata.json
+                var releaseDir = Path.GetDirectoryName(discFile);
+                var titleDir = releaseDir is not null ? Path.GetDirectoryName(releaseDir) : null;
+                if (titleDir is not null)
+                {
+                    var metadataFile = Path.Combine(titleDir, "metadata.json");
+                    if (File.Exists(metadataFile))
                     {
-                        // Attach the parent media item info to the disc for later use
-                        disc.Release = release;
-                        disc.MediaItem = mediaItem;
-                        _logger.LogInformation(
-                            "TheDiscDb matched hash {Hash} to \"{Series}\" - {DiscName}",
-                            contentHash,
-                            mediaItem.Title,
-                            disc.Name);
-                        return disc;
+                        try
+                        {
+                            var metaJson = File.ReadAllText(metadataFile);
+                            disc.MediaItem = JsonSerializer.Deserialize<MediaItemMetadata>(metaJson);
+                        }
+                        catch (JsonException)
+                        {
+                            // Skip corrupt metadata
+                        }
                     }
                 }
+
+                _index[disc.ContentHash] = disc;
             }
+            catch (JsonException ex)
+            {
+                _logger.LogWarning(ex, "TheDiscDb: Failed to parse {File}", discFile);
+            }
+        }
 
-            _logger.LogDebug("Hash {Hash} matched media item \"{Title}\" but no disc with that hash found", contentHash, mediaItem.Title);
-            return null;
-        }
-        catch (HttpRequestException ex)
-        {
-            _logger.LogWarning(ex, "Failed to query TheDiscDb API for hash {Hash}", contentHash);
-            return null;
-        }
-    }
-
-    /// <inheritdoc/>
-    public void Dispose()
-    {
-        if (!_disposed)
-        {
-            _httpClient.Dispose();
-            _disposed = true;
-        }
+        _logger.LogInformation("TheDiscDb: Indexed {Count} discs", _index.Count);
     }
 }

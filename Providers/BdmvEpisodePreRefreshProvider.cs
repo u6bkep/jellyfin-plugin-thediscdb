@@ -55,8 +55,8 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
             return Task.FromResult(ItemUpdateType.None);
         }
 
-        var episodeTag = parts[2]; // e.g., "S03E01"
-        if (!TryParseEpisodeTag(episodeTag, out var seasonNumber, out var episodeNumber))
+        var episodeTag = parts[2]; // e.g., "S03E01" or "S01E01-E02"
+        if (!TryParseEpisodeTag(episodeTag, out var seasonNumber, out var episodeNumber, out var episodeNumberEnd))
         {
             return Task.FromResult(ItemUpdateType.None);
         }
@@ -71,6 +71,17 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
                 episodeNumber,
                 item.Path);
             item.IndexNumber = episodeNumber;
+            changed = ItemUpdateType.MetadataEdit;
+        }
+
+        if (item.IndexNumberEnd != episodeNumberEnd)
+        {
+            _logger.LogInformation(
+                "TheDiscDb: Restoring episode end number {Old} -> {New} for {Path}",
+                item.IndexNumberEnd,
+                episodeNumberEnd,
+                item.Path);
+            item.IndexNumberEnd = episodeNumberEnd;
             changed = ItemUpdateType.MetadataEdit;
         }
 
@@ -107,15 +118,16 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
         return Task.FromResult(changed);
     }
 
-    private static bool TryParseEpisodeTag(string tag, out int season, out int episode)
+    private static bool TryParseEpisodeTag(string tag, out int season, out int episode, out int? episodeEnd)
     {
         season = 0;
         episode = 0;
+        episodeEnd = null;
 
-        // Parse "S03E01"
+        // Parse "S03E01" or "S01E01-E02"
         var match = System.Text.RegularExpressions.Regex.Match(
             tag,
-            @"^S(\d+)E(\d+)$",
+            @"^S(\d+)E(\d+)(?:-E(\d+))?$",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
         if (!match.Success)
@@ -123,7 +135,18 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
             return false;
         }
 
-        return int.TryParse(match.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out season)
-            && int.TryParse(match.Groups[2].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out episode);
+        if (!int.TryParse(match.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out season)
+            || !int.TryParse(match.Groups[2].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out episode))
+        {
+            return false;
+        }
+
+        if (match.Groups[3].Success
+            && int.TryParse(match.Groups[3].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var endVal))
+        {
+            episodeEnd = endVal;
+        }
+
+        return true;
     }
 }
