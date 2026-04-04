@@ -11,6 +11,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="test/**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Jellyfin.Controller" Version="10.11.6">
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>

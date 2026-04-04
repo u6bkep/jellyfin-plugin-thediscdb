@@ -6,93 +6,33 @@ using System.Text.Json.Serialization;
 namespace Jellyfin.Plugin.TheDiscDb.TheDiscDb;
 
 /// <summary>
-/// Root response from a TheDiscDb GraphQL query.
-/// </summary>
-public class DiscQueryResult
-{
-    [JsonPropertyName("data")]
-    public DiscQueryData? Data { get; set; }
-}
-
-/// <summary>
-/// Top-level data wrapper.
-/// </summary>
-public class DiscQueryData
-{
-    [JsonPropertyName("mediaItems")]
-    public MediaItemConnection? MediaItems { get; set; }
-}
-
-/// <summary>
-/// Relay-style connection for media items.
-/// </summary>
-public class MediaItemConnection
-{
-    [JsonPropertyName("nodes")]
-    public List<MediaItemNode>? Nodes { get; set; }
-}
-
-/// <summary>
-/// A media item (series or movie) from TheDiscDb.
-/// </summary>
-public class MediaItemNode
-{
-    [JsonPropertyName("title")]
-    public string? Title { get; set; }
-
-    [JsonPropertyName("slug")]
-    public string? Slug { get; set; }
-
-    [JsonPropertyName("externalids")]
-    public ExternalIds? ExternalIds { get; set; }
-
-    [JsonPropertyName("releases")]
-    public List<ReleaseNode>? Releases { get; set; }
-}
-
-/// <summary>
-/// A physical release (box set, single disc release) from TheDiscDb.
-/// </summary>
-public class ReleaseNode
-{
-    [JsonPropertyName("title")]
-    public string? Title { get; set; }
-
-    [JsonPropertyName("slug")]
-    public string? Slug { get; set; }
-
-    [JsonPropertyName("discs")]
-    public List<DiscNode>? Discs { get; set; }
-}
-
-/// <summary>
-/// A single disc from TheDiscDb.
+/// A single disc from the TheDiscDb data repo (discNN.json).
 /// </summary>
 public class DiscNode
 {
-    [JsonPropertyName("contentHash")]
+    [JsonPropertyName("ContentHash")]
     public string? ContentHash { get; set; }
 
-    [JsonPropertyName("name")]
+    [JsonPropertyName("Name")]
     public string? Name { get; set; }
 
-    [JsonPropertyName("slug")]
+    [JsonPropertyName("Slug")]
     public string? Slug { get; set; }
 
-    [JsonPropertyName("titles")]
+    [JsonPropertyName("Titles")]
     public List<DiscTitle>? Titles { get; set; }
 
     /// <summary>
-    /// Gets or sets the parent release (populated client-side after query).
+    /// Gets or sets the path to the disc JSON file (populated at index time).
     /// </summary>
     [JsonIgnore]
-    public ReleaseNode? Release { get; set; }
+    public string? SourcePath { get; set; }
 
     /// <summary>
-    /// Gets or sets the parent media item (populated client-side after query).
+    /// Gets or sets the parent media item metadata (populated at index time).
     /// </summary>
     [JsonIgnore]
-    public MediaItemNode? MediaItem { get; set; }
+    public MediaItemMetadata? MediaItem { get; set; }
 }
 
 /// <summary>
@@ -100,22 +40,22 @@ public class DiscNode
 /// </summary>
 public class DiscTitle
 {
-    [JsonPropertyName("index")]
+    [JsonPropertyName("Index")]
     public int Index { get; set; }
 
-    [JsonPropertyName("sourceFile")]
+    [JsonPropertyName("SourceFile")]
     public string? SourceFile { get; set; }
 
-    [JsonPropertyName("segmentMap")]
+    [JsonPropertyName("SegmentMap")]
     public string? SegmentMap { get; set; }
 
-    [JsonPropertyName("duration")]
+    [JsonPropertyName("Duration")]
     public string? Duration { get; set; }
 
-    [JsonPropertyName("size")]
+    [JsonPropertyName("Size")]
     public long Size { get; set; }
 
-    [JsonPropertyName("item")]
+    [JsonPropertyName("Item")]
     public DiscTitleItem? Item { get; set; }
 }
 
@@ -124,17 +64,32 @@ public class DiscTitle
 /// </summary>
 public class DiscTitleItem
 {
-    [JsonPropertyName("title")]
+    [JsonPropertyName("Title")]
     public string? Title { get; set; }
 
-    [JsonPropertyName("type")]
+    [JsonPropertyName("Type")]
     public string? Type { get; set; }
 
-    [JsonPropertyName("season")]
+    [JsonPropertyName("Season")]
     public string? Season { get; set; }
 
-    [JsonPropertyName("episode")]
+    [JsonPropertyName("Episode")]
     public string? Episode { get; set; }
+}
+
+/// <summary>
+/// Media item metadata from the repo (metadata.json).
+/// </summary>
+public class MediaItemMetadata
+{
+    [JsonPropertyName("Title")]
+    public string? Title { get; set; }
+
+    [JsonPropertyName("Slug")]
+    public string? Slug { get; set; }
+
+    [JsonPropertyName("ExternalIds")]
+    public ExternalIds? ExternalIds { get; set; }
 }
 
 /// <summary>
@@ -142,9 +97,9 @@ public class DiscTitleItem
 /// </summary>
 public class ExternalIds
 {
-    [JsonPropertyName("tmdb")]
+    [JsonPropertyName("Tmdb")]
     public string? Tmdb { get; set; }
 
-    [JsonPropertyName("imdb")]
+    [JsonPropertyName("Imdb")]
     public string? Imdb { get; set; }
 }

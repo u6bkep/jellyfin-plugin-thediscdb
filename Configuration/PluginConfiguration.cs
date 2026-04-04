@@ -8,12 +8,7 @@ namespace Jellyfin.Plugin.TheDiscDb.Configuration;
 public class PluginConfiguration : BasePluginConfiguration
 {
     /// <summary>
-    /// Gets or sets the TheDiscDb GraphQL API endpoint.
+    /// Gets or sets the path to a local clone of the TheDiscDb/data git repository.
     /// </summary>
-    public string ApiEndpoint { get; set; } = "https://thediscdb.com/graphql";
-
-    /// <summary>
-    /// Gets or sets the cache duration in hours for TheDiscDb lookups.
-    /// </summary>
-    public int CacheHours { get; set; } = 168; // 1 week
+    public string DataRepoPath { get; set; } = string.Empty;
 }

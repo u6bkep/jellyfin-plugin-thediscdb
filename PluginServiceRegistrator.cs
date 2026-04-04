@@ -1,6 +1,4 @@
-using System.IO;
 using Jellyfin.Plugin.TheDiscDb.TheDiscDb;
-using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
@@ -20,9 +18,8 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         {
             var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
             var logger = loggerFactory.CreateLogger(nameof(TheDiscDbClient));
-            var appPaths = sp.GetRequiredService<IApplicationPaths>();
-            var cacheDir = Path.Combine(appPaths.CachePath, "thediscdb");
-            return new TheDiscDbClient(logger, cacheDir);
+            var repoPath = TheDiscDbPlugin.Instance?.Configuration.DataRepoPath ?? string.Empty;
+            return new TheDiscDbClient(logger, repoPath);
         });
 
         // BdmvEpisodeResolver is discovered via assembly scanning (GetExportTypes<IItemResolver>)
