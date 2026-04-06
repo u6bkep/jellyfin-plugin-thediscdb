@@ -334,19 +334,22 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
             return null;
         }
 
-        var mplsPath = Path.Combine(playlistDir, title.SourceFile);
-        if (!File.Exists(mplsPath))
+        // SourceFile can be a .mpls (playlist) or .m2ts (stream) file
+        var filePath = ResolveSourceFile(discRoot, playlistDir, title.SourceFile);
+        if (filePath is null)
         {
-            _logger.LogDebug("TheDiscDb: Playlist file not found for extra: {Path}", mplsPath);
+            _logger.LogDebug("TheDiscDb: Source file not found for extra: {File}", title.SourceFile);
             return null;
         }
 
         var extraType = MapExtraType(title.Item.Type, title.Item.Title);
 
+        var isBluRay = filePath.EndsWith(".mpls", StringComparison.OrdinalIgnoreCase);
+
         var video = new Video
         {
-            Path = mplsPath,
-            VideoType = VideoType.BluRay,
+            Path = filePath,
+            VideoType = isBluRay ? VideoType.BluRay : VideoType.VideoFile,
             Name = title.Item.Title ?? "Extra",
             ExtraType = extraType,
             ProviderIds = new Dictionary<string, string>
@@ -361,6 +364,35 @@ public class BdmvEpisodeResolver : IItemResolver, IMultiItemResolver
         }
 
         return video;
+    }
+
+    /// <summary>
+    /// Resolves a TheDiscDb SourceFile to a full path. Playlist files (.mpls) live
+    /// in BDMV/PLAYLIST/, stream files (.m2ts) in BDMV/STREAM/.
+    /// </summary>
+    private static string? ResolveSourceFile(string discRoot, string playlistDir, string sourceFile)
+    {
+        if (sourceFile.EndsWith(".mpls", StringComparison.OrdinalIgnoreCase))
+        {
+            var path = Path.Combine(playlistDir, sourceFile);
+            return File.Exists(path) ? path : null;
+        }
+
+        if (sourceFile.EndsWith(".m2ts", StringComparison.OrdinalIgnoreCase))
+        {
+            var path = Path.Combine(discRoot, "BDMV", "STREAM", sourceFile);
+            return File.Exists(path) ? path : null;
+        }
+
+        // Unknown extension — try PLAYLIST first, then STREAM
+        var tryPlaylist = Path.Combine(playlistDir, sourceFile);
+        if (File.Exists(tryPlaylist))
+        {
+            return tryPlaylist;
+        }
+
+        var tryStream = Path.Combine(discRoot, "BDMV", "STREAM", sourceFile);
+        return File.Exists(tryStream) ? tryStream : null;
     }
 
     /// <summary>
