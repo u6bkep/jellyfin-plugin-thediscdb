@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Providers;
+using MediaBrowser.Model.IO;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.TheDiscDb.Providers;
@@ -17,17 +18,32 @@ namespace Jellyfin.Plugin.TheDiscDb.Providers;
 /// the m2ts filename and merging remote provider data with shouldReplace=true.
 /// By running as a post-merge custom provider (NOT IPreRefreshProvider), we get the
 /// final word on the episode numbering after all other providers have finished.
+///
+/// When a "Replace all metadata" refresh corrupts the season number (because
+/// FillMissingEpisodeNumbersFromPath misparses .mpls filenames like "00201.mpls" as
+/// S02E01), this provider:
+///   1. Restores the correct season/episode from the TheDiscDb provider ID
+///   2. Clears the Name/Overview (which came from the wrong TMDB season)
+///   3. Queues a follow-up FullRefresh (without ReplaceAllMetadata) so TMDB
+///      re-fetches using the corrected numbers
 /// </summary>
 public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
 {
     private readonly ILogger<BdmvEpisodePreRefreshProvider> _logger;
+    private readonly IProviderManager _providerManager;
+    private readonly IFileSystem _fileSystem;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="BdmvEpisodePreRefreshProvider"/> class.
     /// </summary>
-    public BdmvEpisodePreRefreshProvider(ILogger<BdmvEpisodePreRefreshProvider> logger)
+    public BdmvEpisodePreRefreshProvider(
+        ILogger<BdmvEpisodePreRefreshProvider> logger,
+        IProviderManager providerManager,
+        IFileSystem fileSystem)
     {
         _logger = logger;
+        _providerManager = providerManager;
+        _fileSystem = fileSystem;
     }
 
     /// <inheritdoc />
@@ -40,13 +56,6 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
         {
             return Task.FromResult(ItemUpdateType.None);
         }
-
-        _logger.LogInformation(
-            "TheDiscDb PreRefresh: Processing {Name} (S{Season}E{Ep}) with ID={DiscDbId}",
-            item.Name,
-            item.ParentIndexNumber,
-            item.IndexNumber,
-            discDbId);
 
         // Format: "hash:playlist:SxxExx:Title"
         var parts = discDbId.Split(':', 4);
@@ -62,6 +71,7 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
         }
 
         var changed = ItemUpdateType.None;
+        var seasonWasWrong = item.ParentIndexNumber != seasonNumber;
 
         if (item.IndexNumber != episodeNumber)
         {
@@ -85,7 +95,7 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
             changed = ItemUpdateType.MetadataEdit;
         }
 
-        if (item.ParentIndexNumber != seasonNumber)
+        if (seasonWasWrong)
         {
             _logger.LogInformation(
                 "TheDiscDb: Restoring season number {Old} -> {New} for {Path}",
@@ -94,24 +104,32 @@ public class BdmvEpisodePreRefreshProvider : ICustomMetadataProvider<Episode>
                 item.Path);
             item.ParentIndexNumber = seasonNumber;
             changed = ItemUpdateType.MetadataEdit;
+
+            // The season was wrong, which means TMDB fetched metadata from the wrong
+            // season. Clear name/overview so the queued re-refresh can populate them
+            // correctly. The merge logic fills in empty fields even with shouldReplace=false.
+            _logger.LogInformation(
+                "TheDiscDb: Season was wrong — clearing Name/Overview and queuing re-refresh for {Path}",
+                item.Path);
+            item.Name = null;
+            item.Overview = null;
+
+            var refreshOptions = new MetadataRefreshOptions(new DirectoryService(_fileSystem))
+            {
+                MetadataRefreshMode = MetadataRefreshMode.FullRefresh,
+                ReplaceAllMetadata = false,
+                ForceSave = true
+            };
+            _providerManager.QueueRefresh(item.Id, refreshOptions, RefreshPriority.Normal);
         }
 
-        // Restore name if it was set by TheDiscDb (part 4 of the provider ID)
+        // Restore name from TheDiscDb if it's still a bare playlist filename
         if (parts.Length >= 4 && !string.IsNullOrEmpty(parts[3]))
         {
-            var discDbName = parts[3];
-            // Only restore if the current name looks wrong (matches the m2ts filename pattern)
-            if (item.Name is null
-                || item.Name.StartsWith("0", StringComparison.Ordinal)
-                || !item.Name.Equals(discDbName, StringComparison.Ordinal))
+            if (item.Name is null || System.Text.RegularExpressions.Regex.IsMatch(item.Name, @"^\d{5}$"))
             {
-                // Don't override names that came from a remote provider (TMDB)
-                // Only override if name is clearly wrong (filename-based)
-                if (item.Name is null || System.Text.RegularExpressions.Regex.IsMatch(item.Name, @"^\d{5}$"))
-                {
-                    item.Name = discDbName;
-                    changed = ItemUpdateType.MetadataEdit;
-                }
+                item.Name = parts[3];
+                changed = ItemUpdateType.MetadataEdit;
             }
         }
 
