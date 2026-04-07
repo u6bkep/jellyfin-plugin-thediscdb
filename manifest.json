@@ -1,0 +1,20 @@
+[
+  {
+    "guid": "0e7042ee-3337-4599-9cbf-e8b743a3850d",
+    "name": "TheDiscDb",
+    "description": "Resolves BDMV Blu-ray folders into individual episodes using playlist-to-episode mappings from TheDiscDb.",
+    "overview": "BDMV episode resolver using TheDiscDb data",
+    "owner": "u6bkep",
+    "category": "Metadata",
+    "versions": [
+      {
+        "version": "0.1.0.0",
+        "changelog": "Initial release: BDMV episode resolution, content hashing, local TheDiscDb data repo integration, pre-refresh metadata provider.",
+        "targetAbi": "10.11.6.0",
+        "sourceUrl": "https://github.com/u6bkep/jellyfin-plugin-thediscdb/releases/download/v0.1.0/jellyfin-plugin-thediscdb-v0.1.0.zip",
+        "checksum": "",
+        "timestamp": "2026-04-06T00:00:00Z"
+      }
+    ]
+  }
+]

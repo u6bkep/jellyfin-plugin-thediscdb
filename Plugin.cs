@@ -34,5 +34,5 @@ public class TheDiscDbPlugin : BasePlugin<PluginConfiguration>
     public override string Description => "Resolves BDMV folders into individual episodes using TheDiscDb.";
 
     /// <inheritdoc />
-    public override Guid Id => new("a1b2c3d4-5678-9abc-def0-123456789abc");
+    public override Guid Id => new("0e7042ee-3337-4599-9cbf-e8b743a3850d");
 }
